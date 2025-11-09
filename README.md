@@ -96,5 +96,8 @@ In altre parole, puoi adattare lo script alla tua struttura di dataset, ma **non
 Se non sei sicuro su come adattare la struttura dei file o i percorsi di input,  
 **fatti aiutare da ChatGPT**: può fornirti suggerimenti passo-passo per modificare correttamente i percorsi, i nomi dei file o i pattern di ricerca, mantenendo intatta la logica originale del codice.
 Questo README è stato corretto da chatGPT, faccio schifo a scrivere
+
+SE VE LA SENTITE, MIGLIORATE LA LOGICA DEL CODICE E CERCATE DI RENDERLO PIU' EFFICIENTE, ANCHE SE NON SERVE
+SKULLSTRIPPING.PY FUNZIONA ANCHE CON ALTRI TOOL DI SKULLSTRIPPING, SE NON VI PIACE ROBEX CAMBIATE TOOL. IL TOOL CHE CAMBIERETE DEVE AVERE I SUOI OPPORTUNI COMANDI BASH PER ESSERE ESEGUITO E MODIFICATE IL CODICE CAMBIANDO IL BASH
 ---
 
