@@ -56,9 +56,7 @@ python skullstripping.py -h
 Per eseguire correttamente lo skull-stripping è necessario scaricare **ROBEX-V12**, uno strumento esterno utilizzato dal codice:
 
 🔗 [Scarica ROBEX-V12 da NITRC](https://www.nitrc.org/projects/robex)
-
-Una volta scaricato, assicurati che il percorso all’eseguibile di ROBEX sia configurato correttamente nel tuo script o nel PATH di sistema.
-
+***Importante*** quando esegui skulltripping.py assicurati che in --robex_dir inserisci il path della cartella che contiene il file .bat  (../ROBEX)
 ---
 
 ### 5. Registrazione allo standard MNI152
