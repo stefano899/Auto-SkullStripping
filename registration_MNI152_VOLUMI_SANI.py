@@ -4,11 +4,17 @@ import glob
 import ants
 import sys
 
+# proviamo a importare tqdm per la progress bar
+try:
+    from tqdm import tqdm
+except ImportError:
+    tqdm = None
+
 # ======================================================
 # CONFIG
 # ======================================================
-SRC_ROOT = r"E:\Datasets\VOLUMI-SANI-1mm"          # dataset sorgente
-DST_ROOT = r"E:\Datasets\Volumi_sani_1mm_MNI"      # dataset di output (stessa struttura)
+SRC_ROOT = r"E:\Datasets\NIMH\ds005752-download_coregistrati"          # dataset sorgente
+DST_ROOT = r"E:\Datasets\NIMH\ds005752-download_coregistrati_MNI"      # dataset di output (stessa struttura)
 
 # metti qui il tuo template MNI
 MNI_T1 = r"C:\Users\stefa\Documents\cervelli\SkullStripping\Mni152Registration\mni152\icbm_avg_152_t1_tal_nlin_symmetric_VI_mask.nii"
@@ -59,8 +65,7 @@ def discover_skullstripped_folders(root: str):
     # ora li ordino in modo crescente per numero dopo "sub"
     def sort_key(item):
         subj_name, relp = item
-        # subj_name tipo "sub01" o "sub100"
-        num_part = subj_name[3:].lstrip("-")  # toglie "sub"
+        num_part = subj_name[3:].lstrip("-")
         try:
             return int(num_part)
         except ValueError:
@@ -77,9 +82,6 @@ def ensure_parent_dir(p: Path):
 
 
 def with_to_mni_suffix(name: str) -> str:
-    """
-    Aggiunge _to_mni PRIMA dell'estensione, mantenendo il nome di input.
-    """
     low = name.lower()
     if low.endswith(".nii.gz"):
         base = name[:-7]
@@ -92,11 +94,6 @@ def with_to_mni_suffix(name: str) -> str:
 
 
 def find_modality_file(folder: Path, modality: str) -> Path | None:
-    """
-    Cerca la modalità dentro la cartella skullstripped:
-    - ignora file che hanno 'mask' nel nome
-    - se un file ha sia 'flair' che 't2' → lo consideriamo FLAIR
-    """
     files = list(folder.glob("*.nii")) + list(folder.glob("*.nii.gz"))
     modality = modality.upper()
 
@@ -196,14 +193,25 @@ def main():
     mni_img = ants.image_read(MNI_T1)
 
     skull_folders = discover_skullstripped_folders(SRC_ROOT)
-    print(f"[INFO] Cartelle skullstripped trovate (ordinate): {len(skull_folders)}")
+    total = len(skull_folders)
+    print(f"[INFO] Cartelle skullstripped trovate (ordinate): {total}")
 
-    for subject, rel_skull in skull_folders:
-        print(f"\n=== {subject} | {rel_skull} ===")
+    # se abbiamo tqdm, la usiamo
+    iterator = skull_folders
+    if tqdm is not None:
+        iterator = tqdm(skull_folders, desc="Registrazione su MNI", unit="cartella")
+
+    for i, (subject, rel_skull) in enumerate(iterator, start=1):
+        if tqdm is None:
+            # fallback: stampa progress semplice
+            print(f"\n[{i}/{total}] === {subject} | {rel_skull} ===")
+        else:
+            # con tqdm stampiamo meno roba, ma teniamo il blocco funzionale
+            print(f"\n=== {subject} | {rel_skull} ===")
 
         # sorgente e destinazione con la STESSA struttura
         src_skull = src_root / subject / rel_skull
-        dst_skull = dst_root / subject / rel_skull   # <- stessa struttura
+        dst_skull = dst_root / subject / rel_skull
         dst_skull.mkdir(parents=True, exist_ok=True)
         print(f"  📁 Output: {dst_skull}")
 

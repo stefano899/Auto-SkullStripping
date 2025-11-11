@@ -10,18 +10,25 @@ from pathlib import Path
 import random
 from datetime import datetime
 
+# proviamo a usare tqdm per la barra di avanzamento
+try:
+    from tqdm import tqdm
+except ImportError:
+    tqdm = None
+
 # ========================================
 # CONFIG
 # ========================================
-base_root = r"E:\Datasets\Volumi_sani_1mm_MNI"
+base_root = r"E:\Datasets\NIMH\ds005752-download_coregistrati_MNI"
 
 # 🔹 output globale per il TRAIN (quello che vuoi tu)
-TRAIN_ROOT = r"C:\Users\Stefano\Desktop\Stefano\CycleGan\pytorch-CycleGAN-and-pix2pix\data_training\trainT1_FLAIR_SANI"
+TRAIN_ROOT = r"E:\Datasets\datasets_training\trainT1_T2_SANI\train"
 GLOBAL_TRAIN_A = os.path.join(TRAIN_ROOT, "trainA")  # T1
 GLOBAL_TRAIN_B = os.path.join(TRAIN_ROOT, "trainB")  # FLAIR
-
+TARGET_MODALITY_trainA = "T1"
+TARGET_MODALITY_trainB = "T2"
 # 🔹 output strutturato per il TEST
-TEST_ROOT = r"C:\Users\Stefano\Desktop\Stefano\CycleGan\pytorch-CycleGAN-and-pix2pix\data_training\test\soggetti"
+TEST_ROOT = r"E:\Datasets\datasets_training\trainT1_T2_SANI\test"
 
 os.makedirs(GLOBAL_TRAIN_A, exist_ok=True)
 os.makedirs(GLOBAL_TRAIN_B, exist_ok=True)
@@ -217,7 +224,6 @@ def save_png_respecting_overwrite(img_array_uint8, dst_folder, filename):
     if not os.path.exists(out_path):
         imageio.imwrite(out_path, img_array_uint8)
         return
-    # se non posso sovrascrivere e c'è già → skip
     return
 
 
@@ -230,9 +236,6 @@ def save_slices_for_orientation(subject,
                                 valid_indices,
                                 local_out_dir,
                                 subject_in_test: bool):
-    """
-    Salva le slice locali e quelle globali (train/test) a seconda se il soggetto è nel test.
-    """
     ymin, xmin, ymax, xmax = crop_box
 
     if orientation == 'axial':
@@ -244,7 +247,6 @@ def save_slices_for_orientation(subject,
 
     os.makedirs(local_out_dir, exist_ok=True)
 
-    # per il test devo sapere se è una sessione
     session = None
     parts = rel_patient.replace("\\", "/").split("/")
     for p in parts:
@@ -276,17 +278,17 @@ def save_slices_for_orientation(subject,
                 else:
                     base = os.path.join(subj_root, "test")
 
-                if modality.upper() == "T1":
+                if modality.upper() == TARGET_MODALITY_trainA:
                     final_dir = os.path.join(base, "testA")
-                elif modality.upper() == "FLAIR":
+                elif modality.upper() == TARGET_MODALITY_trainB:
                     final_dir = os.path.join(base, "testB")
                 else:
                     final_dir = None
             else:
                 # struttura per il train
-                if modality.upper() == "T1":
+                if modality.upper() == TARGET_MODALITY_trainA:
                     final_dir = GLOBAL_TRAIN_A
-                elif modality.upper() == "FLAIR":
+                elif modality.upper() == TARGET_MODALITY_trainB:
                     final_dir = GLOBAL_TRAIN_B
                 else:
                     final_dir = None
@@ -414,10 +416,17 @@ if __name__ == "__main__":
     missing_skull = []
     global_crop_valid = None
 
+    total_pairs = len(pairs)
+    # se abbiamo tqdm, usiamola per le coppie
+    pair_iter = pairs
+    if tqdm is not None:
+        pair_iter = tqdm(pairs, desc="Estrazione slice", unit="cartella")
+
     # 2) processiamo tutte le coppie, ma sapendo se il soggetto è nel test
-    for subject, rel_patient in pairs:
-        in_test = subject in test_subjects
-        ok, global_crop_valid = process_subject(subject, rel_patient, global_crop_valid, in_test)
+    for idx, (subject, rel_patient) in enumerate(pair_iter, start=1):
+        if tqdm is None:
+            print(f"\n[{idx}/{total_pairs}] Processing {subject} | {rel_patient}")
+        ok, global_crop_valid = process_subject(subject, rel_patient, global_crop_valid, subject in test_subjects)
         if not ok:
             missing_skull.append(f"{subject}/{rel_patient}")
 
@@ -437,8 +446,8 @@ if __name__ == "__main__":
     count_B = count_png(GLOBAL_TRAIN_B)
 
     print("\n📊 Riepilogo finale (solo train):")
-    print(f"  - trainA (T1)   : {count_A:,} immagini")
-    print(f"  - trainB (FLAIR): {count_B:,} immagini")
+    print(f"  - trainA ({TARGET_MODALITY_trainA})   : {count_A:,} immagini")
+    print(f"  - trainB ({TARGET_MODALITY_trainB}): {count_B:,} immagini")
     if count_A == count_B:
         print("✅ Le due cartelle hanno lo stesso numero di immagini (ottimo).")
     else:

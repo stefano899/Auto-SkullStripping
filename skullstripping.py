@@ -10,6 +10,12 @@ import SimpleITK as sitk
 import shutil
 import sys
 
+# proviamo a usare tqdm per la progress bar
+try:
+    from tqdm import tqdm
+except ImportError:
+    tqdm = None
+
 # ---------------------------------------------------------
 # helper
 # ---------------------------------------------------------
@@ -151,7 +157,6 @@ def already_skullstripped(anat_dir: Path) -> bool:
     out_dir = anat_dir / "skullstripped"
     if not out_dir.is_dir():
         return False
-    # se c'è almeno una mask dentro, consideriamo fatto
     masks = list(out_dir.glob("*-mask.nii*"))
     return len(masks) > 0
 
@@ -193,9 +198,18 @@ def main():
         return 999999
 
     subjects = sorted(subjects, key=sub_key)
+    total_subj = len(subjects)
 
-    for subj in subjects:
-        print(f"\n=== {subj.name} ===")
+    # se abbiamo tqdm, la usiamo
+    subj_iter = subjects
+    if tqdm is not None:
+        subj_iter = tqdm(subjects, desc="Skullstripping", unit="soggetto")
+
+    for idx, subj in enumerate(subj_iter, start=1):
+        if tqdm is None:
+            print(f"\n[{idx}/{total_subj}] === {subj.name} ===")
+        else:
+            print(f"\n=== {subj.name} ===")
 
         anat_dirs = get_all_anat_dirs(subj)
         if not anat_dirs:
@@ -295,3 +309,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+# python skullstrip_robex.py --robex_dir C:\ROBEX --subjects_root E:\Datasets\...

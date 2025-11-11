@@ -2,9 +2,15 @@ import os
 from pathlib import Path
 import SimpleITK as sitk
 
+# proviamo a usare tqdm per la barra di avanzamento
+try:
+    from tqdm import tqdm
+except ImportError:
+    tqdm = None
+
 # ===================== CONFIG =====================
 
-BASE_DATASET = Path(r"E:\Datasets\VOLUMI-SANI-1mm")  # root dataset
+BASE_DATASET = Path(r"E:\Datasets\NIMH\ds005752-download")  # root dataset originale
 MODE = "affine"
 SAVE_TFM = True
 
@@ -13,6 +19,14 @@ ITERS = 300
 SAMPLING_PCT = 0.25
 SHRINK = (4, 2, 1)
 SMOOTH = (2, 1, 0)
+
+OUTPUT_FOLDER_NAME = "coregistrati_t1"
+
+# === NUOVO: root parallela dove salvare SOLO i coregistrati ===
+PARALLEL_ROOT = BASE_DATASET.parent / f"{BASE_DATASET.name}_coregistrati"
+
+# excel di mappatura soggetti messo nella root parallela
+EXCEL_OUT = PARALLEL_ROOT / "coregistrati_mapping.xlsx"
 
 # ===================== FUNZIONI BASE =====================
 
@@ -28,6 +42,46 @@ def write_tx(tx: sitk.Transform, p: Path):
     p.parent.mkdir(parents=True, exist_ok=True)
     sitk.WriteTransform(tx, str(p))
     print(f"[SAVED TX] {p.resolve()}")
+
+def ensure_isotropic_1mm(img: sitk.Image, label: str = "") -> sitk.Image:
+    """
+    Se lo spacing non è (1,1,1) lo riscampiona con nearest neighbor a 1mm isotropico.
+    Stampa sempre lo spacing prima e dopo.
+    """
+    spacing = img.GetSpacing()
+    if label:
+        print(f"      📏 Spacing {label} originale: {spacing}")
+
+    # se è già 1mm, stampo e ritorno
+    if all(abs(s - 1.0) < 1e-6 for s in spacing):
+        print(f"      ✅ {label} già isotropico (1.0, 1.0, 1.0)")
+        return img
+
+    orig_size = img.GetSize()
+    new_spacing = (1.0, 1.0, 1.0)
+    new_size = [
+        int(round(orig_size[i] * (spacing[i] / new_spacing[i])))
+        for i in range(3)
+    ]
+
+    print(f"      ↪️  Resampling {label} a 1mm NN")
+    print(f"         - old spacing: {spacing}")
+    print(f"         - old size: {orig_size}")
+    print(f"         - new size: {new_size}")
+
+    resampled = sitk.Resample(
+        img,
+        new_size,
+        sitk.Transform(),
+        sitk.sitkNearestNeighbor,
+        img.GetOrigin(),
+        new_spacing,
+        img.GetDirection(),
+        0,
+        img.GetPixelID(),
+    )
+    print(f"      ✅ Spacing {label} dopo resampling: {resampled.GetSpacing()}")
+    return resampled
 
 def build_init_tx(fixed: sitk.Image, moving: sitk.Image, mode: str):
     base = sitk.Euler3DTransform() if mode == "rigid" else sitk.AffineTransform(3)
@@ -79,52 +133,63 @@ def find_modalities_in_folder(folder: Path):
             flair = p
     return t1, t2, flair
 
-# ===================== CHECK GIÀ FATTO =====================
+# ===================== CHECK GIÀ FATTO (sulla cartella parallela) =====================
 
-def already_processed(work_dir: Path, t1_name: str | None) -> bool:
-    """
-    work_dir: la cartella dove stiamo lavorando (anat o anat/3dVOL)
-    t1_name: nome del file T1 che useremmo come riferimento
-    Ritorna True se esiste già la cartella di output e (se sappiamo il nome T1)
-    c'è già la T1 dentro.
-    """
-    out_dir = work_dir / "volumi_coregistrati_alla_t1"
+def already_processed(parallel_anat_dir: Path, t1_name: str | None) -> bool:
+    out_dir = parallel_anat_dir / OUTPUT_FOLDER_NAME
     if not out_dir.is_dir():
         return False
-
     if t1_name is None:
-        # non so che T1 cercare, ma la cartella esiste → consideriamo fatto
         return True
+    return (out_dir / t1_name).is_file()
 
-    t1_out = out_dir / t1_name
-    return t1_out.is_file()
+# ===================== EXCEL / CSV =====================
+
+def save_subject_mapping(mapping: list[tuple[int, str]], xlsx_path: Path):
+    xlsx_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        from openpyxl import Workbook
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "mappatura"
+        ws.append(["new_sub_id", "original_folder"])
+        for idx, original in mapping:
+            ws.append([f"sub-{idx:02d}", original])
+        wb.save(str(xlsx_path))
+        print(f"📑 Mappatura soggetti salvata in: {xlsx_path}")
+    except ImportError:
+        csv_path = xlsx_path.with_suffix(".csv")
+        import csv
+        with csv_path.open("w", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            w.writerow(["new_sub_id", "original_folder"])
+            for idx, original in mapping:
+                w.writerow([f"sub-{idx:02d}", original])
+        print(f"📑 openpyxl non disponibile, mappatura salvata in CSV: {csv_path}")
 
 # ===================== PROCESS ANAT =====================
 
-def process_anat_folder(anat_dir: Path):
-    if not anat_dir.is_dir():
-        print(f"   ❌ {anat_dir} non è una cartella, salto.")
+def process_anat_folder(src_anat_dir: Path, dst_anat_dir: Path):
+    if not src_anat_dir.is_dir():
+        print(f"   ❌ {src_anat_dir} non è una cartella, salto.")
         return
 
-    # se c'è 3dVOL lavoriamo lì
-    vol_dir = anat_dir / "3dVOL"
+    vol_dir = src_anat_dir / "3dVOL"
     if vol_dir.is_dir():
         work_dir = vol_dir
-        print(f"   📁 Uso la cartella 3dVOL: {work_dir}")
+        print(f"   📁 Uso la cartella 3dVOL (input): {work_dir}")
     else:
-        work_dir = anat_dir
-        print(f"   📁 Uso la cartella anat direttamente: {work_dir}")
+        work_dir = src_anat_dir
+        print(f"   📁 Uso la cartella anat direttamente (input): {work_dir}")
 
-    # cerco i volumi
     t1_p, t2_p, flair_p = find_modalities_in_folder(work_dir)
 
     if t1_p is None:
         print(f"   ❌ Nessuna T1 (t1w / mprage) trovata in {work_dir}, salto.")
         return
 
-    # prima di fare tutto, controlliamo se è già stato fatto
-    if already_processed(work_dir, t1_p.name):
-        print(f"   ✅ Coregistrazione già presente per {work_dir}, salto.")
+    if already_processed(dst_anat_dir, t1_p.name):
+        print(f"   ✅ Coregistrazione già presente per {dst_anat_dir}, salto.")
         return
 
     print(f"   ✅ Trovata T1: {t1_p.name}")
@@ -137,13 +202,14 @@ def process_anat_folder(anat_dir: Path):
     else:
         print(f"   ℹ️  Nessuna FLAIR trovata.")
 
+    # T1
     t1_img = read_img(t1_p)
+    t1_img = ensure_isotropic_1mm(t1_img, label="T1")
 
-    out_dir = work_dir / "volumi_coregistrati_alla_t1"
+    out_dir = dst_anat_dir / OUTPUT_FOLDER_NAME
     out_dir.mkdir(parents=True, exist_ok=True)
-    print(f"   📂 Cartella di output: {out_dir}")
+    print(f"   📂 Cartella di output parallela: {out_dir}")
 
-    # salvo la T1 di riferimento
     write_img(t1_img, out_dir / t1_p.name)
 
     # T2 → T1
@@ -153,6 +219,7 @@ def process_anat_folder(anat_dir: Path):
         t2_tx, t2_metric = register(t1_img, t2_img, mode=MODE)
         print(f"   📏 Metrica T2→T1: {t2_metric:.6f}")
         t2_coreg = resample_with_tx(t2_img, t1_img, t2_tx, interp=sitk.sitkLinear, default_val=0.0)
+        t2_coreg = ensure_isotropic_1mm(t2_coreg, label="T2_coreg")
         write_img(t2_coreg, out_dir / t2_p.name)
         if SAVE_TFM:
             write_tx(t2_tx, out_dir / f"{t2_p.stem}_to_T1.tfm")
@@ -164,6 +231,7 @@ def process_anat_folder(anat_dir: Path):
         flair_tx, flair_metric = register(t1_img, flair_img, mode=MODE)
         print(f"   📏 Metrica FLAIR→T1: {flair_metric:.6f}")
         flair_coreg = resample_with_tx(flair_img, t1_img, flair_tx, interp=sitk.sitkLinear, default_val=0.0)
+        flair_coreg = ensure_isotropic_1mm(flair_coreg, label="FLAIR_coreg")
         write_img(flair_coreg, out_dir / flair_p.name)
         if SAVE_TFM:
             write_tx(flair_tx, out_dir / f"{flair_p.stem}_to_T1.tfm")
@@ -176,12 +244,13 @@ def main():
         print(f"❌ Base dataset non trovata: {base}")
         return
 
-    print(f"🔎 Scansiono i soggetti in: {base}")
+    PARALLEL_ROOT.mkdir(parents=True, exist_ok=True)
 
-    # prendi tutte le cartelle che iniziano con "sub" (sub01, sub1, sub-ON...)
+    print(f"🔎 Scansiono i soggetti in: {base}")
+    print(f"📦 Salverò i coregistrati in: {PARALLEL_ROOT}")
+
     sub_dirs = [p for p in base.iterdir() if p.is_dir() and p.name.lower().startswith("sub")]
 
-    # ordina per numero dopo "sub"
     def sub_key(p: Path):
         name = p.name.lower()
         rest = name[3:]
@@ -197,28 +266,48 @@ def main():
         print("⚠️ Nessuna cartella che inizi con 'sub'")
         return
 
-    for sub_dir in sub_dirs:
-        print(f"\n📂 Soggetto: {sub_dir.name}")
+    total = len(sub_dirs)
+    mapping = []
+
+    # se abbiamo tqdm, la usiamo
+    iterator = sub_dirs
+    if tqdm is not None:
+        iterator = tqdm(sub_dirs, desc="Coregistrazione soggetti", unit="soggetto")
+
+    for idx, sub_dir in enumerate(iterator, start=1):
+        if tqdm is None:
+            print(f"\n📂 Soggetto ({idx}/{total}): {sub_dir.name}")
+        else:
+            print(f"\n📂 Soggetto: {sub_dir.name}")
+
+        mapping.append((idx, sub_dir.name))
+
+        parallel_sub_dir = PARALLEL_ROOT / sub_dir.name
+        parallel_sub_dir.mkdir(parents=True, exist_ok=True)
 
         ses_dirs = list(sub_dir.glob("ses-*"))
         if not ses_dirs:
             print("   ⚠️ Nessuna cartella 'ses-*' trovata.")
-            anat_dir = sub_dir / "anat"
-            if anat_dir.is_dir():
-                print(f"   ✅ Trovata cartella anat: {anat_dir}")
-                process_anat_folder(anat_dir)
+            src_anat_dir = sub_dir / "anat"
+            if src_anat_dir.is_dir():
+                print(f"   ✅ Trovata cartella anat: {src_anat_dir}")
+                dst_anat_dir = parallel_sub_dir / "anat"
+                process_anat_folder(src_anat_dir, dst_anat_dir)
             else:
                 print(f"   ❌ Nessuna cartella anat trovata in {sub_dir}")
             continue
 
         for ses_dir in ses_dirs:
             print(f"   📁 Sessione: {ses_dir.name}")
-            anat_dir = ses_dir / "anat"
-            if anat_dir.is_dir():
-                print(f"      ✅ Trovata anat: {anat_dir}")
-                process_anat_folder(anat_dir)
+            src_anat_dir = ses_dir / "anat"
+            if src_anat_dir.is_dir():
+                print(f"      ✅ Trovata anat: {src_anat_dir}")
+                dst_anat_dir = parallel_sub_dir / ses_dir.name / "anat"
+                process_anat_folder(src_anat_dir, dst_anat_dir)
             else:
                 print(f"      ❌ Nessuna cartella anat trovata in {ses_dir}")
+
+    save_subject_mapping(mapping, EXCEL_OUT)
 
     print("\n✅ Coregistrazione completata per tutte le cartelle trovate.")
 
