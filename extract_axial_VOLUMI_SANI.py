@@ -1,10 +1,7 @@
 import os
-import re
 import shutil
 import nibabel as nib
 import numpy as np
-from skimage.transform import resize
-from nibabel.processing import resample_to_output
 import imageio
 from pathlib import Path
 import random
@@ -17,18 +14,19 @@ except ImportError:
     tqdm = None
 
 # ========================================
-# CONFIG
+# CONFIG GENERALE
 # ========================================
-base_root = r"E:\Datasets\NIMH\ds005752-download_coregistrati_MNI"
+base_root = r"C:\Users\Stefano\Desktop\Stefano\Datasets\IXI-SKULLSTRIPPED\IXI_SKULLSTRIPPED_MNI"
 
-# 🔹 output globale per il TRAIN (quello che vuoi tu)
-TRAIN_ROOT = r"E:\Datasets\datasets_training\trainT1_T2_SANI\train"
-GLOBAL_TRAIN_A = os.path.join(TRAIN_ROOT, "trainA")  # T1
-GLOBAL_TRAIN_B = os.path.join(TRAIN_ROOT, "trainB")  # FLAIR
+# 🔹 output globale per il TRAIN
+TRAIN_ROOT = r"C:\Users\Stefano\Desktop\Stefano\CycleGan\pytorch-CycleGAN-and-pix2pix\data_training\training_T1_PD_Sani_NO-RESIZE\train"
+GLOBAL_TRAIN_A = os.path.join(TRAIN_ROOT, "trainA")  # es: T1
+GLOBAL_TRAIN_B = os.path.join(TRAIN_ROOT, "trainB")  # es: FLAIR
 TARGET_MODALITY_trainA = "T1"
-TARGET_MODALITY_trainB = "T2"
+TARGET_MODALITY_trainB = "PD"
+
 # 🔹 output strutturato per il TEST
-TEST_ROOT = r"E:\Datasets\datasets_training\trainT1_T2_SANI\test"
+TEST_ROOT = r"C:\Users\Stefano\Desktop\Stefano\CycleGan\pytorch-CycleGAN-and-pix2pix\data_training\training_T1_PD_Sani_NO-RESIZE\test"
 
 os.makedirs(GLOBAL_TRAIN_A, exist_ok=True)
 os.makedirs(GLOBAL_TRAIN_B, exist_ok=True)
@@ -37,14 +35,19 @@ os.makedirs(TEST_ROOT, exist_ok=True)
 # 🔴 se False non sovrascrive i PNG esistenti
 OVERWRITE = True
 
-# modalità di riferimento per il crop
+# modalità di riferimento per trovare le slice da togliere e da tenere
 ref_modality = "FLAIR"
 
-# parametri
-nz_threshold = 5000
-resize_shape = (256, 256)
-voxel_sizes = (1, 1, 1)
+# threshold per tenere/filtrare slice troppo vuote (calcolato SOLO su ref_modality)
+nz_threshold = 3000
 
+# ========================================
+# CONFIG SPLIT TRAIN/TEST
+# ========================================
+TRAIN_FRACTION = 0.8
+N_TRAIN_SUBJECTS = 300  # se != None, ignora TRAIN_FRACTION e usa questo numero assoluto
+
+# fissiamo seed per riproducibilità
 random.seed(42)
 
 # ========================================
@@ -89,8 +92,12 @@ def path_modality(subject: str, rel_patient: str, modality: str):
 
     patterns = {
         "FLAIR": ["flair"],
-        "T1": ["t1w", "mprage"],
-        "T2": ["t2w", "_t2", "-t2", "t2."],
+        "T1": ["t1w", "mprage","T1","t1"],
+        "T2": ["t2w", "_t2", "-t2", "t2.","T2"],
+        # per PD, T1c, GADO potresti aggiungere pattern se servono
+        "PD": ["_pd", "pd.","PD"],
+        "T1c": ["t1c", "t1_gad", "t1-contr", "t1ce"],
+        "GADO": ["gado"],
     }
 
     wanted = patterns.get(modality, [])
@@ -103,6 +110,7 @@ def path_modality(subject: str, rel_patient: str, modality: str):
         if "mask" in f_low:
             continue
 
+        # se contiene sia flair che t2 -> lo considero flair, non T2
         if "flair" in f_low and "t2" in f_low:
             if modality == "FLAIR":
                 return os.path.join(folder, f)
@@ -134,17 +142,26 @@ def output_root(subject: str, rel_patient: str) -> str:
 # ========================================
 # FUNZIONI DI ELABORAZIONE
 # ========================================
-def load_and_resample(path, is_mask=False):
+def load_and_normalize(path, is_mask=False):
+    """
+    NON fa il resample.
+    Carica il volume così com'è nel NIfTI e lo normalizza in [0,1]
+    dopo lo z-score (valori negativi tagliati a 0 all'inizio).
+    """
     img = nib.load(path)
-    order = 0 if is_mask else 1
-    resampled_img = resample_to_output(img, voxel_sizes=voxel_sizes, order=order)
-    data = resampled_img.get_fdata()
 
+    # Shape del volume originale
+    print("  Shape volume ORIGINALE:", img.shape)
+
+    data = img.get_fdata()
+
+    # niente valori negativi prima di tutto
     data[data < 0] = 0
 
     if is_mask:
         return data
 
+    # z-score
     mean = np.mean(data)
     std = np.std(data)
     if std > 0:
@@ -152,6 +169,7 @@ def load_and_resample(path, is_mask=False):
     else:
         data = np.zeros_like(data)
 
+    # normalizzazione [0,1]
     dmin, dmax = np.nanmin(data), np.nanmax(data)
     if dmax > dmin:
         data = (data - dmin) / (dmax - dmin)
@@ -161,43 +179,46 @@ def load_and_resample(path, is_mask=False):
     return data
 
 
-def compute_crop_and_valid_slices(ref_vol, orientation, nz_threshold, resize_shape):
-    if orientation == 'axial':
-        mask2d = np.any(ref_vol > 0, axis=2)
-        slicer = lambda idx: ref_vol[:, :, idx]
-        n_slices = ref_vol.shape[2]
-    elif orientation == 'coronal':
-        mask2d = np.any(ref_vol > 0, axis=1)
-        slicer = lambda idx: ref_vol[:, idx, :]
-        n_slices = ref_vol.shape[1]
-    elif orientation == 'sagittal':
-        mask2d = np.any(ref_vol > 0, axis=0)
-        slicer = lambda idx: ref_vol[idx, :, :]
-        n_slices = ref_vol.shape[0]
-    else:
-        raise ValueError("orientation deve essere 'axial', 'coronal' o 'sagittal'.")
+def find_trim_indices(ref_vol: np.ndarray, eps: float = 0.0):
+    """
+    Trova UNA slice per ciascun asse (X, Y, Z) nel volume di riferimento,
+    scegliendo ogni volta la slice con meno voxel non-zero.
+    Non modifica il volume, ritorna solo gli indici.
+    """
+    # Asse 0 (X)
+    nz_counts_x = np.count_nonzero(ref_vol > eps, axis=(1, 2))
+    idx_x = int(np.argmin(nz_counts_x))
 
-    coords = np.argwhere(mask2d)
-    if coords.size == 0:
-        raise ValueError(f"Nessun voxel non-zero nel volume di riferimento per {orientation}")
+    # Asse 1 (Y)
+    nz_counts_y = np.count_nonzero(ref_vol > eps, axis=(0, 2))
+    idx_y = int(np.argmin(nz_counts_y))
 
-    ymin, xmin = coords.min(axis=0)
-    ymax, xmax = coords.max(axis=0)
+    # Asse 2 (Z)
+    nz_counts_z = np.count_nonzero(ref_vol > eps, axis=(0, 1))
+    idx_z = int(np.argmin(nz_counts_z))
 
-    valid_indices = []
-    for i in range(n_slices):
-        slice_2d = slicer(i)
-        cropped = slice_2d[ymin:ymax+1, xmin:xmax+1]
-        resized = resize(cropped, resize_shape, preserve_range=True,
-                         anti_aliasing=True, order=1)
-        out_uint8 = (resized * 255).astype(np.uint8)
-        if np.count_nonzero(out_uint8) >= nz_threshold:
-            valid_indices.append(i)
+    print(f"  Slice da rimuovere (ref_modality): X={idx_x}, Y={idx_y}, Z={idx_z}")
+    return idx_x, idx_y, idx_z
 
-    return (ymin, xmin, ymax, xmax), valid_indices
+
+def apply_trim_indices(vol: np.ndarray, idx_x: int, idx_y: int, idx_z: int):
+    """
+    Applica gli indici di trim a un volume:
+    rimuove 1 slice lungo ciascun asse in posizione (idx_x, idx_y, idx_z).
+    """
+    vol_out = vol
+    # ordine: prima X, poi Y, poi Z
+    vol_out = np.delete(vol_out, idx_x, axis=0)
+    vol_out = np.delete(vol_out, idx_y, axis=1)
+    vol_out = np.delete(vol_out, idx_z, axis=2)
+    return vol_out
 
 
 def build_slice_name(subject, rel_patient, modality, slice_idx, ext=".png"):
+    """
+    Nome file = subject[_session]_MODALITY_slice_XXX.png
+    Dove session è opzionale (solo se nel path c'è qualcosa tipo 'ses-01').
+    """
     session = None
     parts = rel_patient.replace("\\", "/").split("/")
     for p in parts:
@@ -224,7 +245,56 @@ def save_png_respecting_overwrite(img_array_uint8, dst_folder, filename):
     if not os.path.exists(out_path):
         imageio.imwrite(out_path, img_array_uint8)
         return
+    # altrimenti non sovrascrivo
     return
+
+
+def compute_valid_slice_indices(ref_vol_trimmed: np.ndarray, nz_threshold: int):
+    """
+    Usa SOLO il volume di riferimento già trimmato (es. FLAIR)
+    per decidere quali indici di slice tenere per ciascuna orientazione.
+    Ritorna un dict:
+        {
+          "axial":    [idx1, idx2, ...],
+          "coronal":  [idx1, idx2, ...],
+          "sagittal": [idx1, idx2, ...]
+        }
+    """
+    valid = {}
+
+    # Assiale: slice lungo Z
+    axial_indices = []
+    for i in range(ref_vol_trimmed.shape[2]):
+        sl = ref_vol_trimmed[:, :, i]
+        img_uint8 = (sl * 255).astype(np.uint8)
+        if np.count_nonzero(img_uint8) >= nz_threshold:
+            axial_indices.append(i)
+    valid["axial"] = axial_indices
+
+    # Coronale: slice lungo Y
+    coronal_indices = []
+    for i in range(ref_vol_trimmed.shape[1]):
+        sl = ref_vol_trimmed[:, i, :]
+        img_uint8 = (sl * 255).astype(np.uint8)
+        if np.count_nonzero(img_uint8) >= nz_threshold:
+            coronal_indices.append(i)
+    valid["coronal"] = coronal_indices
+
+    # Sagittale: slice lungo X
+    sagittal_indices = []
+    for i in range(ref_vol_trimmed.shape[0]):
+        sl = ref_vol_trimmed[i, :, :]
+        img_uint8 = (sl * 255).astype(np.uint8)
+        if np.count_nonzero(img_uint8) >= nz_threshold:
+            sagittal_indices.append(i)
+    valid["sagittal"] = sagittal_indices
+
+    print("  Indici validi (calcolati su ref_modality trimmato):")
+    print(f"    axial   : {len(valid['axial'])} slice")
+    print(f"    coronal : {len(valid['coronal'])} slice")
+    print(f"    sagittal: {len(valid['sagittal'])} slice")
+
+    return valid
 
 
 def save_slices_for_orientation(subject,
@@ -232,21 +302,39 @@ def save_slices_for_orientation(subject,
                                 modality,
                                 vol,
                                 orientation,
-                                crop_box,
-                                valid_indices,
                                 local_out_dir,
-                                subject_in_test: bool):
-    ymin, xmin, ymax, xmax = crop_box
+                                subject_in_test: bool,
+                                slice_indices=None):
+    """
+    Estrae le slice lungo una certa orientazione.
+    NON applica più nz_threshold qui: gli indici delle slice da salvare
+    sono passati tramite slice_indices, calcolati sul volume di riferimento.
 
+    Salva:
+      - localmente (Output/...)
+      - globalmente in trainA/trainB oppure testA/testB (solo AXIAL).
+    """
     if orientation == 'axial':
+        n_slices = vol.shape[2]
         slicer = lambda idx: vol[:, :, idx]
     elif orientation == 'coronal':
+        n_slices = vol.shape[1]
         slicer = lambda idx: vol[:, idx, :]
-    else:
+    elif orientation == 'sagittal':
+        n_slices = vol.shape[0]
         slicer = lambda idx: vol[idx, :, :]
+    else:
+        raise ValueError("orientation deve essere 'axial', 'coronal' o 'sagittal'.")
 
     os.makedirs(local_out_dir, exist_ok=True)
 
+    # se non specificato, di default usa tutte le slice
+    if slice_indices is None:
+        indices = range(n_slices)
+    else:
+        indices = slice_indices
+
+    # recupero sessione (se esiste) per la struttura di test
     session = None
     parts = rel_patient.replace("\\", "/").split("/")
     for p in parts:
@@ -255,18 +343,16 @@ def save_slices_for_orientation(subject,
             break
 
     count = 0
-    for i in valid_indices:
-        sl = slicer(i)
-        cropped = sl[ymin:ymax+1, xmin:xmax+1]
-        resized = resize(cropped, resize_shape, preserve_range=True, anti_aliasing=True)
-        out_slice = (resized * 255).astype(np.uint8)
+    for i in indices:
+        sl = slicer(i)  # slice 2D già normalizzata [0,1]
+        img_uint8 = (sl * 255).astype(np.uint8)
 
         fname = build_slice_name(subject, rel_patient, modality, i, ext=".png")
 
         # 1) salvataggio locale
         local_path = os.path.join(local_out_dir, fname)
         if OVERWRITE or not os.path.exists(local_path):
-            imageio.imwrite(local_path, out_slice)
+            imageio.imwrite(local_path, img_uint8)
 
         # 2) salvataggio globale solo per AXIAL
         if orientation == "axial":
@@ -294,7 +380,9 @@ def save_slices_for_orientation(subject,
                     final_dir = None
 
             if final_dir is not None:
-                save_png_respecting_overwrite(out_slice, final_dir, fname)
+                save_png_respecting_overwrite(img_array_uint8=img_uint8,
+                                              dst_folder=final_dir,
+                                              filename=fname)
 
         count += 1
 
@@ -304,13 +392,13 @@ def save_slices_for_orientation(subject,
 # ========================================
 # PROCESS DI UN SOGGETTO/ANAT
 # ========================================
-def process_subject(subject: str, rel_patient: str, global_crop_valid, subject_in_test: bool):
+def process_subject(subject: str, rel_patient: str, subject_in_test: bool):
     print(f"\n=== {subject} | {rel_patient} ===")
 
     skull_dir = os.path.join(base_root, subject, rel_patient)
     if not os.path.isdir(skull_dir):
         print(f"[SKIP] Nessuna cartella skullstripped qui: {skull_dir}")
-        return False, global_crop_valid
+        return False
 
     # output locale
     out_root = output_root(subject, rel_patient)
@@ -325,69 +413,73 @@ def process_subject(subject: str, rel_patient: str, global_crop_valid, subject_i
 
     # cerca volumi
     modalities_paths = {}
-    for m in ["FLAIR", "T1", "T2"]:
+    for m in ["FLAIR", "T1", "T2", "PD", "T1c", "GADO"]:
         p = path_modality(subject, rel_patient, m)
         if p is not None and os.path.isfile(p):
             modalities_paths[m] = p
 
     if not modalities_paths:
         print(f"[SKIP] Nessuna modalità trovata in {skull_dir}")
-        return False, global_crop_valid
+        return False
 
-    # volume di riferimento
+    # volume di riferimento (FLAIR se presente, altrimenti T1/T2)
     if ref_modality in modalities_paths:
         ref_path = modalities_paths[ref_modality]
     else:
         ref_path = modalities_paths.get("T1") or modalities_paths.get("T2")
         if ref_path is None:
             print(f"[SKIP] Nessuna modalità di riferimento trovata.")
-            return False, global_crop_valid
+            return False
 
-    ref_vol = load_and_resample(ref_path, is_mask=False)
+    print(f"  Volume di riferimento per trim e selezione slice: {ref_path}")
+    ref_vol = load_and_normalize(ref_path, is_mask=False)
+
+    # trova indici delle slice da rimuovere su ref_modality
+    idx_x, idx_y, idx_z = find_trim_indices(ref_vol, eps=0.0)
+
+    # volume di riferimento trimmato
+    ref_trimmed = apply_trim_indices(ref_vol, idx_x, idx_y, idx_z)
+    print(f"  Shape {ref_modality} dopo trim (solo check): {ref_trimmed.shape}")
+
+    # 🔹 calcola gli indici di slice validi (una volta sola) sul ref_vol trimmato
+    valid_slice_indices = compute_valid_slice_indices(ref_trimmed, nz_threshold)
 
     orientations = ["axial", "coronal", "sagittal"]
 
-    # crop globale
-    if global_crop_valid is None:
-        crop_valid = {}
-        for ori in orientations:
-            crop_box, valid_idx = compute_crop_and_valid_slices(ref_vol, ori, nz_threshold, resize_shape)
-            crop_valid[ori] = (crop_box, valid_idx)
-            print(f"[{ori}] Kept {len(valid_idx)} slices (DEFINITO come riferimento globale)")
-        global_crop_valid = crop_valid
-    else:
-        print("Uso crop INDICI GLOBALI già calcolati.")
-
     # per ogni modalità
     for mod, vol_path in modalities_paths.items():
+        print(f"  -> Modalità: {mod} | file: {vol_path}")
         mod_dir = os.path.join(out_root, mod)
         os.makedirs(mod_dir, exist_ok=True)
 
-        vol = load_and_resample(vol_path, is_mask=False)
+        vol = load_and_normalize(vol_path, is_mask=False)
+        print(f"    Shape {mod} prima del trim: {vol.shape}")
+
+        # applico GLI STESSI indici trovati su ref_modality
+        vol = apply_trim_indices(vol, idx_x, idx_y, idx_z)
+        print(f"    Shape {mod} dopo trim: {vol.shape}")
 
         total_saved = 0
         for ori in orientations:
-            crop_box, valid_idx = global_crop_valid[ori]
             ori_dir = os.path.join(mod_dir, ori)
             os.makedirs(ori_dir, exist_ok=True)
 
             saved = save_slices_for_orientation(
-                subject,
-                rel_patient,
-                mod,
-                vol,
-                ori,
-                crop_box,
-                valid_idx,
-                ori_dir,
+                subject=subject,
+                rel_patient=rel_patient,
+                modality=mod,
+                vol=vol,
+                orientation=ori,
+                local_out_dir=ori_dir,
                 subject_in_test=subject_in_test,
+                slice_indices=valid_slice_indices[ori],  # 👈 stessi indici per tutte le modalità
             )
             total_saved += saved
-            print(f"Saved {saved} {mod} {ori} slices -> {ori_dir}")
+            print(f"    Saved {saved} {mod} {ori} slices -> {ori_dir}")
 
-        print(f"=> {mod}: {total_saved} slice totali.")
+        print(f"  => {mod}: {total_saved} slice totali salvate.")
 
-    return True, global_crop_valid
+    return True
 
 
 # ========================================
@@ -397,36 +489,46 @@ if __name__ == "__main__":
     # 1) scopriamo tutte le coppie soggetto/rel
     pairs = list(discover_subject_anat_pairs(base_root))
 
-    # ricaviamo i soggetti unici che hanno almeno una coppia
+    # soggetti unici che hanno almeno una coppia
     subjects_with_pairs = sorted({subj for subj, _ in pairs})
     n_total = len(subjects_with_pairs)
-    n_test = max(1, int(n_total * 0.20))
+
+    # 🔹 decidi quanti soggetti vanno in train
+    if N_TRAIN_SUBJECTS is not None:
+        # uso numero assoluto, clamped in [1, n_total-1]
+        n_train = max(1, min(N_TRAIN_SUBJECTS, n_total - 1))
+    else:
+        # uso la frazione
+        n_train = int(round(n_total * TRAIN_FRACTION))
+        n_train = max(1, min(n_train, n_total - 1))
+
+    n_test = n_total - n_train
 
     random.shuffle(subjects_with_pairs)
-    test_subjects = set(subjects_with_pairs[:n_test])
-    train_subjects = set(subjects_with_pairs[n_test:])
+    train_subjects = set(subjects_with_pairs[:n_train])
+    test_subjects = set(subjects_with_pairs[n_train:])
 
     print("==================================================")
     print(f"RUN estrazione: {datetime.now().isoformat(sep=' ', timespec='seconds')}")
     print(f"Soggetti totali con skullstripped: {n_total}")
-    print(f"In TEST (20%): {len(test_subjects)}")
-    print(f"In TRAIN:       {len(train_subjects)}")
+    print(f"In TRAIN: {len(train_subjects)}")
+    print(f"In TEST : {len(test_subjects)}")
     print("==================================================")
 
     missing_skull = []
-    global_crop_valid = None
 
     total_pairs = len(pairs)
-    # se abbiamo tqdm, usiamola per le coppie
+    # se abbiamo tqdm, usiamola
     pair_iter = pairs
     if tqdm is not None:
         pair_iter = tqdm(pairs, desc="Estrazione slice", unit="cartella")
 
-    # 2) processiamo tutte le coppie, ma sapendo se il soggetto è nel test
+    # 2) processiamo tutte le coppie, sapendo se il soggetto è nel test
     for idx, (subject, rel_patient) in enumerate(pair_iter, start=1):
         if tqdm is None:
             print(f"\n[{idx}/{total_pairs}] Processing {subject} | {rel_patient}")
-        ok, global_crop_valid = process_subject(subject, rel_patient, global_crop_valid, subject in test_subjects)
+
+        ok = process_subject(subject, rel_patient, subject in test_subjects)
         if not ok:
             missing_skull.append(f"{subject}/{rel_patient}")
 
@@ -446,8 +548,8 @@ if __name__ == "__main__":
     count_B = count_png(GLOBAL_TRAIN_B)
 
     print("\n📊 Riepilogo finale (solo train):")
-    print(f"  - trainA ({TARGET_MODALITY_trainA})   : {count_A:,} immagini")
-    print(f"  - trainB ({TARGET_MODALITY_trainB}): {count_B:,} immagini")
+    print(f"  - trainA ({TARGET_MODALITY_trainA}) : {count_A:,} immagini")
+    print(f"  - trainB ({TARGET_MODALITY_trainB}) : {count_B:,} immagini")
     if count_A == count_B:
         print("✅ Le due cartelle hanno lo stesso numero di immagini (ottimo).")
     else:
