@@ -21,7 +21,7 @@ base_root = r"C:\Users\Stefano\Desktop\Stefano\Datasets\IXI-SKULLSTRIPPED\IXI_SK
 # 🔹 output globale per il TRAIN
 TRAIN_ROOT = r"C:\Users\Stefano\Desktop\Stefano\CycleGan\pytorch-CycleGAN-and-pix2pix\data_training\training_T1_PD_Sani_NO-RESIZE\train"
 GLOBAL_TRAIN_A = os.path.join(TRAIN_ROOT, "trainA")  # es: T1
-GLOBAL_TRAIN_B = os.path.join(TRAIN_ROOT, "trainB")  # es: FLAIR
+GLOBAL_TRAIN_B = os.path.join(TRAIN_ROOT, "trainB")  # es: PD
 TARGET_MODALITY_trainA = "T1"
 TARGET_MODALITY_trainB = "PD"
 
@@ -32,8 +32,14 @@ os.makedirs(GLOBAL_TRAIN_A, exist_ok=True)
 os.makedirs(GLOBAL_TRAIN_B, exist_ok=True)
 os.makedirs(TEST_ROOT, exist_ok=True)
 
-# 🔴 se False non sovrascrive i PNG esistenti
+# 🔴 se False non sovrascrive i PNG esistenti (logica di base)
 OVERWRITE = True
+
+# 🔹 se True, NON cancella Output e NON sovrascrive niente: aggiunge solo i file mancanti
+ADD_ONLY_MISSING = False
+
+# variabile interna: cosa facciamo davvero sui file?
+EFFECTIVE_OVERWRITE = OVERWRITE and not ADD_ONLY_MISSING
 
 # modalità di riferimento per trovare le slice da togliere e da tenere
 ref_modality = "FLAIR"
@@ -92,10 +98,9 @@ def path_modality(subject: str, rel_patient: str, modality: str):
 
     patterns = {
         "FLAIR": ["flair"],
-        "T1": ["t1w", "mprage","T1","t1"],
-        "T2": ["t2w", "_t2", "-t2", "t2.","T2"],
-        # per PD, T1c, GADO potresti aggiungere pattern se servono
-        "PD": ["_pd", "pd.","PD"],
+        "T1": ["t1w", "mprage", "t1", "T1"],
+        "T2": ["t2w", "_t2", "-t2", "t2.", "T2"],
+        "PD": ["_pd", "pd.", "PD"],
         "T1c": ["t1c", "t1_gad", "t1-contr", "t1ce"],
         "GADO": ["gado"],
     }
@@ -238,7 +243,7 @@ def save_png_respecting_overwrite(img_array_uint8, dst_folder, filename):
     os.makedirs(dst_folder, exist_ok=True)
     out_path = os.path.join(dst_folder, filename)
 
-    if OVERWRITE:
+    if EFFECTIVE_OVERWRITE:
         imageio.imwrite(out_path, img_array_uint8)
         return
 
@@ -311,7 +316,7 @@ def save_slices_for_orientation(subject,
     sono passati tramite slice_indices, calcolati sul volume di riferimento.
 
     Salva:
-      - localmente (Output/...)
+      - localmente (Output/.../ALL_AXES/...)
       - globalmente in trainA/trainB oppure testA/testB (solo AXIAL).
     """
     if orientation == 'axial':
@@ -351,7 +356,7 @@ def save_slices_for_orientation(subject,
 
         # 1) salvataggio locale
         local_path = os.path.join(local_out_dir, fname)
-        if OVERWRITE or not os.path.exists(local_path):
+        if EFFECTIVE_OVERWRITE or not os.path.exists(local_path):
             imageio.imwrite(local_path, img_uint8)
 
         # 2) salvataggio globale solo per AXIAL
@@ -390,6 +395,48 @@ def save_slices_for_orientation(subject,
 
 
 # ========================================
+# COPIA VOLUMI ORIGINALI NELLA STRUTTURA DI TEST
+# ========================================
+def copy_originals_to_test(subject, rel_patient, modalities_paths, subject_in_test: bool):
+    """
+    Se il soggetto è nel TEST, copia i volumi originali nella struttura:
+      TEST_ROOT/subject[/ses-XX]/anat/skullstripped/
+    senza sovrascrivere se EFFECTIVE_OVERWRITE = False.
+    """
+    if not subject_in_test:
+        return
+
+    # trova eventuale sessione
+    session = None
+    parts = rel_patient.replace("\\", "/").split("/")
+    for p in parts:
+        if p.lower().startswith("ses-"):
+            session = p
+            break
+
+    subj_root = os.path.join(TEST_ROOT, subject)
+    if session:
+        skull_dir = os.path.join(subj_root, session, "anat", "skullstripped")
+    else:
+        skull_dir = os.path.join(subj_root, "anat", "skullstripped")
+
+    os.makedirs(skull_dir, exist_ok=True)
+
+    for mod, src_path in modalities_paths.items():
+        if src_path is None or not os.path.isfile(src_path):
+            continue
+        fname = os.path.basename(src_path)
+        dst_path = os.path.join(skull_dir, fname)
+
+        if os.path.exists(dst_path) and not EFFECTIVE_OVERWRITE:
+            # non tocco il file esistente
+            continue
+
+        shutil.copy2(src_path, dst_path)
+        print(f"   [TEST COPY] {mod}: {src_path} -> {dst_path}")
+
+
+# ========================================
 # PROCESS DI UN SOGGETTO/ANAT
 # ========================================
 def process_subject(subject: str, rel_patient: str, subject_in_test: bool):
@@ -404,7 +451,8 @@ def process_subject(subject: str, rel_patient: str, subject_in_test: bool):
     out_root = output_root(subject, rel_patient)
     out_parent = os.path.dirname(out_root)
 
-    if OVERWRITE:
+    # pulizia solo se veramente in modalità overwrite piena
+    if EFFECTIVE_OVERWRITE:
         if os.path.isdir(out_parent):
             print(f"   🧹 Output esistente trovato ({out_parent}), lo elimino e ricreo...")
             shutil.rmtree(out_parent)
@@ -421,6 +469,9 @@ def process_subject(subject: str, rel_patient: str, subject_in_test: bool):
     if not modalities_paths:
         print(f"[SKIP] Nessuna modalità trovata in {skull_dir}")
         return False
+
+    # 🔹 copia i volumi originali nella struttura di TEST (se soggetto di test)
+    copy_originals_to_test(subject, rel_patient, modalities_paths, subject_in_test)
 
     # volume di riferimento (FLAIR se presente, altrimenti T1/T2)
     if ref_modality in modalities_paths:
@@ -472,7 +523,7 @@ def process_subject(subject: str, rel_patient: str, subject_in_test: bool):
                 orientation=ori,
                 local_out_dir=ori_dir,
                 subject_in_test=subject_in_test,
-                slice_indices=valid_slice_indices[ori],  # 👈 stessi indici per tutte le modalità
+                slice_indices=valid_slice_indices[ori],  # stessi indici per tutte le modalità
             )
             total_saved += saved
             print(f"    Saved {saved} {mod} {ori} slices -> {ori_dir}")
@@ -513,6 +564,7 @@ if __name__ == "__main__":
     print(f"Soggetti totali con skullstripped: {n_total}")
     print(f"In TRAIN: {len(train_subjects)}")
     print(f"In TEST : {len(test_subjects)}")
+    print(f"MODALITÀ FILE: OVERWRITE={OVERWRITE} | ADD_ONLY_MISSING={ADD_ONLY_MISSING} | EFFECTIVE_OVERWRITE={EFFECTIVE_OVERWRITE}")
     print("==================================================")
 
     missing_skull = []
